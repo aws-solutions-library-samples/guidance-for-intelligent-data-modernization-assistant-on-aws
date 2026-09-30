@@ -1,0 +1,1571 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Unified template for IDMA application with Bedrock Knowledge Base and API Gateway'
+
+Parameters:
+  BaseStackName:
+    Type: String
+    Description: Base name for the stack and resources
+    Default: idma
+  
+  AppName:
+    Type: String
+    Description: Name for the Amplify application
+    Default: idma
+  
+  KnowledgeBaseBucketName:
+    Type: String
+    Description: Name of the existing Knowledge Base S3 bucket
+  
+  LambdaCodeBucketName:
+    Type: String
+    Description: Name of the lambda code S3 bucket
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: 
+      - dev
+      - prod
+    Description: Environment name
+  
+  FrontendBucket:
+    Type: String
+    Description: Name of the frontend S3 bucket
+
+  VectorStoreName:
+    Type: String
+    Default: 'idma-vector-store'
+    Description: Name of the Open Search Collection
+
+  DataSourceName:
+    Type: String
+    Default: 'ds-idma-kb'
+    
+  Indexname:
+    Type: String
+    Default: 'idma-vector-store-index'
+    Description: Name of the Open Search Index
+    
+  KnowledgeBaseName:
+    Type: String
+    Default: 'idma-kb'
+
+  IndexCreateLamdaLayer:
+    Type: String
+    Default: 'IndexLayer'
+
+  RandomPrefix:
+    Type: String
+    Description: Random prefix for unique resource naming
+    Default: 'rnd123'
+
+  BasicAuthUsername:
+    Type: String
+    Default: 'idmaadmin'
+    Description: Username for Amplify basic authentication
+    MinLength: 1
+    MaxLength: 255
+
+Resources:
+  # VPC Resources
+  LambdaVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${BaseStackName}-lambda-vpc-${AWS::AccountId}-${RandomPrefix}'
+        - Key: Application
+          Value: idmaresource
+
+  LambdaSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${BaseStackName}-lambda-subnet-1-${AWS::AccountId}-${RandomPrefix}'
+        - Key: Application
+          Value: idmaresource
+
+  LambdaSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${BaseStackName}-lambda-subnet-2-${AWS::AccountId}-${RandomPrefix}'
+        - Key: Application
+          Value: idmaresource          
+
+  # Public subnet for NAT Gateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${BaseStackName}-public-subnet-${AWS::AccountId}-${RandomPrefix}'
+        - Key: Application
+          Value: idmaresource          
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${BaseStackName}-igw-${AWS::AccountId}-${RandomPrefix}'
+        - Key: Application
+          Value: idmaresource
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LambdaVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # NAT Gateway
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${BaseStackName}-nat-gateway-${AWS::AccountId}-${RandomPrefix}'
+        - Key: Application
+          Value: idmaresource          
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LambdaVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${BaseStackName}-public-rt-${AWS::AccountId}-${RandomPrefix}'
+        - Key: Application
+          Value: idmaresource          
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # VPC Flow Logs
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs/${BaseStackName}*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs/${BaseStackName}*:*'
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref LambdaVPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${BaseStackName}'
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+      Tags:
+        - Key: Application
+          Value: idmaresource      
+
+  # Security Groups
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref LambdaVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS services
+      Tags:
+        - Key: Application
+          Value: idmaresource            
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LambdaVPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${BaseStackName}-private-rt-${AWS::AccountId}-${RandomPrefix}
+        - Key: Application
+          Value: idmaresource            
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LambdaSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LambdaSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref LambdaVPC
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource:
+              - !Sub "arn:aws:s3:::${KnowledgeBaseBucketName}"
+              - !Sub "arn:aws:s3:::${KnowledgeBaseBucketName}/*"
+              - !Sub "arn:aws:s3:::${LambdaCodeBucketName}"
+              - !Sub "arn:aws:s3:::${LambdaCodeBucketName}/*"
+              - !Sub 'arn:aws:s3:::idma-kb-${AWS::AccountId}-${AWS::Region}-${Environment}'
+              - "arn:aws:s3:::cloudformation-custom-resource-response-*/*"
+              - !Sub 'arn:aws:s3:::idma-kb-${AWS::AccountId}-${AWS::Region}-${Environment}/*'
+      Tags:
+        - Key: Application
+          Value: idmaresource                
+
+  CloudFormationVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref LambdaVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.cloudformation"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref LambdaSubnet1
+        - !Ref LambdaSubnet2
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Application
+          Value: idmaresource          
+
+  # Bedrock Knowledge Base Roles and Policies
+  BedrockKBExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Amazon Bedrock Knowledge Base Execution Role
+      MaxSessionDuration: '3600'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+  
+  S3AccessPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: 's3-access'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub 'arn:aws:s3:::${KnowledgeBaseBucketName}'
+              - !Sub 'arn:aws:s3:::${KnowledgeBaseBucketName}/*'
+      Roles:
+        - !Ref BedrockKBExecutionRole
+  
+  fmmodelAccessPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: !Sub 'fmmodel-access'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'bedrock:InvokeModel'
+            Resource:
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+      Roles:
+        - !Ref BedrockKBExecutionRole
+
+  # OpenSearch Resources
+  NetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub 'net-${RandomPrefix}'
+      Type: 'network'
+      Description: 'Network policy for collection'
+      Policy: !Sub |
+        [
+          {
+            "Rules":[
+              {
+                "Resource": ["collection/vs-${RandomPrefix}"],
+                "ResourceType": "collection"
+              },
+              {
+                "Resource": ["collection/vs-${RandomPrefix}"],
+                "ResourceType": "dashboard"
+              }
+            ],
+            "AllowFromPublic": true
+          }
+        ]
+
+  EncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub 'enc-${RandomPrefix}'
+      Type: 'encryption'
+      Description: 'Encryption policy for collection'
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "Resource": ["collection/vs-${RandomPrefix}"],
+              "ResourceType": "collection"
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  DataAccessPolicy:
+    Type: 'AWS::OpenSearchServerless::AccessPolicy'
+    Properties:
+      Name: !Sub 'data-${RandomPrefix}'
+      Type: 'data'
+      Description: 'Data access policy for collection'
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "Resource": ["collection/vs-${RandomPrefix}"],
+                "Permission": [
+                  "aoss:CreateCollectionItems",
+                  "aoss:UpdateCollectionItems",
+                  "aoss:DescribeCollectionItems",
+                  "aoss:*"
+                ],
+                "ResourceType": "collection"
+              },
+              {
+                "Resource": ["index/vs-${RandomPrefix}/*"],
+                "Permission": [
+                  "aoss:CreateIndex",
+                  "aoss:UpdateIndex",
+                  "aoss:DescribeIndex",
+                  "aoss:ReadDocument",
+                  "aoss:WriteDocument",
+                  "aoss:*"
+                ],
+                "ResourceType": "index"
+              }
+            ],
+            "Principal": [
+              "arn:aws:iam::${AWS::AccountId}:root",
+              "${BedrockKBExecutionRole.Arn}",
+              "${OpenSearchIndexFunctionRole.Arn}"
+            ]
+          }
+        ]
+
+  OpenSearchCollection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    DependsOn:
+      - NetworkPolicy
+      - EncryptionPolicy
+      - DataAccessPolicy
+    Properties:
+      Name: !Sub 'vs-${RandomPrefix}'
+      Description: 'Vector store collection for knowledge base'
+      Type: 'VECTORSEARCH'
+      StandbyReplicas: 'DISABLED'
+      Tags:
+        - Key: Application
+          Value: idmaresource        
+
+  OpenSearchAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${VectorStoreName}-opensearch-access-${AWS::AccountId}-${RandomPrefix}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - aoss:APIAccessAll
+            Resource:
+              - !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/${OpenSearchCollection}'
+      Roles:
+        - !Ref BedrockKBExecutionRole
+
+  KnowledgeBaseWithAoss:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: 
+        - OpenSearchCollection
+        - OpenSearchIndexFunction
+        - OpenSearchIndex
+    Properties:
+      Name: !Sub '${KnowledgeBaseName}-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Description: 'idma knowledge desc'
+      RoleArn: !GetAtt BedrockKBExecutionRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+          EmbeddingModelConfiguration: 
+              BedrockEmbeddingModelConfiguration:
+                Dimensions: 512
+                EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: "OPENSEARCH_SERVERLESS"
+        OpensearchServerlessConfiguration:
+          CollectionArn: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/${OpenSearchCollection}'
+          VectorIndexName: !Ref Indexname
+          FieldMapping:
+            VectorField: 'vector_field'
+            TextField: 'AMAZON_BEDROCK_TEXT_CHUNK'
+            MetadataField: 'AMAZON_BEDROCK_METADATA'
+
+  SampleDataSource:
+    Type: AWS::Bedrock::DataSource
+    DependsOn: KnowledgeBaseWithAoss
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBaseWithAoss
+      Name: !Sub '${DataSourceName}-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Description: 'Idma data source'
+      DataDeletionPolicy : 'RETAIN'
+      DataSourceConfiguration:
+        Type: "S3"
+        S3Configuration:
+          BucketArn: !Sub 'arn:aws:s3:::${KnowledgeBaseBucketName}'
+
+  # Lambda IAM Role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:ListFoundationModels'
+                  - 'bedrock:GetFoundationModel'
+                  - 'bedrock:QueryKnowledgeBase'
+                  - 'bedrock:RetrieveKnowledgeBase'
+                  - 'bedrock:RetrieveAndGenerate'
+                  - 'bedrock:Retrieve'
+                  - 'bedrock:CreateKnowledgeBase'
+                  - 'bedrock:GetInferenceProfile'
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:*'
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-5'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:foundation-model/us.anthropic.claude-sonnet-5'
+
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${KnowledgeBaseBucketName}'
+                  - !Sub 'arn:aws:s3:::${KnowledgeBaseBucketName}/*'
+                  - !Sub 'arn:aws:s3:::idma-kb-${AWS::AccountId}-${AWS::Region}-${Environment}'
+                  - !Sub 'arn:aws:s3:::idma-kb-${AWS::AccountId}-${AWS::Region}-${Environment}/*'
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'aoss:APIAccessAll'
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+
+  # Lambda Layers
+  LambdaLayer:
+    Type: 'AWS::Lambda::LayerVersion'
+    Properties:
+      LayerName: !Sub '${BaseStackName}-dependencies-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Description: 'Common dependencies for Lambda functions'
+      Content:
+        S3Bucket: !Ref LambdaCodeBucketName
+        S3Key: layers/layer.zip
+      CompatibleRuntimes:
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+
+  VectorLambdaLayer:
+    Type: 'AWS::Lambda::LayerVersion'
+    Properties:
+      LayerName: !Sub '${IndexCreateLamdaLayer}-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Description: 'Dependencies for Vector operations'
+      Content:
+        S3Bucket: !Ref LambdaCodeBucketName
+        S3Key: layers/vectorLayer.zip
+      CompatibleRuntimes:
+        - python3.9
+      CompatibleArchitectures:
+        - x86_64
+
+  # Lambda Functions
+  LambdaFunction1:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: S3VPCEndpoint
+    Properties:
+      FunctionName: !Sub 'idma-bot-handler-function1-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Handler: idma-bot-handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: 
+        S3Bucket: !Ref LambdaCodeBucketName
+        S3Key: lambda/idma-bot-handler.zip
+      Runtime: python3.11
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Layers:
+        - !Ref LambdaLayer
+      Tags:
+        - Key: Application
+          Value: idmaresource          
+
+  LambdaFunction2:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: S3VPCEndpoint
+    Properties:
+      FunctionName: !Sub 'idma-database-migration-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Handler: database-migration.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: 
+        S3Bucket: !Ref LambdaCodeBucketName
+        S3Key: lambda/database-migration.zip
+      Runtime: python3.11
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Layers:
+        - !Ref LambdaLayer
+      Tags:
+        - Key: Application
+          Value: idmaresource          
+
+  LambdaFunction3:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: S3VPCEndpoint
+    Properties:
+      FunctionName: !Sub 'idma-analytics-handler-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Handler: analytics_handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: 
+        S3Bucket: !Ref LambdaCodeBucketName
+        S3Key: lambda/analytics_handler.zip
+      Runtime: python3.11
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Layers:
+        - !Ref LambdaLayer
+      Tags:
+        - Key: Application
+          Value: idmaresource         
+
+  LambdaFunction4:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: S3VPCEndpoint
+    Properties:
+      FunctionName: !Sub 'idma-modern-strategy-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Handler: modern-data-strategy.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: 
+        S3Bucket: !Ref LambdaCodeBucketName
+        S3Key: lambda/modern-data-strategy.zip
+      Runtime: python3.11
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Layers:
+        - !Ref LambdaLayer
+      Tags:
+        - Key: Application
+          Value: idmaresource        
+        
+
+  # Amplify Resources
+  AmplifyBasicAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${BaseStackName}-amplify-basicauth-${Environment}-${RandomPrefix}'
+      Description: Basic auth credentials for the IDMA Amplify frontend
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${BasicAuthUsername}"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        # Basic auth encodes "user:password", so punctuation is excluded to keep
+        # the generated value safe to pass through shells and Authorization headers.
+        ExcludePunctuation: true
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Application
+          Value: idmaresource
+
+  AmplifyServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: amplify.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AmplifyS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${FrontendBucket}'
+                  - !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+        - PolicyName: AmplifyBasicAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - amplify:GetApp
+                  - amplify:GetBranch
+                  - amplify:ListApps
+                  - amplify:ListBranches
+                  - amplify:StartDeployment
+                  - amplify:GetDeployment
+                  - amplify:CreateDeployment
+                  - cloudformation:ListStacks
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStackResources
+                  - cloudformation:ListStackInstances
+                  - cloudformation:DescribeStackEvents
+                Resource: 
+                  - !Sub 'arn:aws:amplify:${AWS::Region}:${AWS::AccountId}:apps/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*'
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    DependsOn: AmplifyServiceRole
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Platform: WEB_COMPUTE
+      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
+      BasicAuthConfig:
+        EnableBasicAuth: true
+        Username: !Ref BasicAuthUsername
+        Password: !Sub '{{resolve:secretsmanager:${AmplifyBasicAuthSecret}:SecretString:password}}'
+      BuildSpec: !Sub |
+        version: 1
+        frontend:
+          phases:
+            build:
+              commands:
+                - aws s3 sync s3://${FrontendBucket} /tmp/build/
+          artifacts:
+            baseDirectory: /tmp/build
+            files:
+              - '**/*'
+      CustomRules:
+        - Source: </^[^.]+$|\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json)$)([^.]+$)/>
+          Target: /index.html
+          Status: '200'
+      EnvironmentVariables:
+        - Name: FRONTEND_BUCKET
+          Value: !Ref FrontendBucket
+      Tags:
+        - Key: Application
+          Value: idmaresource           
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: false
+      Stage: PRODUCTION
+      Framework: React
+      BasicAuthConfig:
+        EnableBasicAuth: true
+        Username: !Ref BasicAuthUsername
+        Password: !Sub '{{resolve:secretsmanager:${AmplifyBasicAuthSecret}:SecretString:password}}'
+      Tags:
+        - Key: Application
+          Value: idmaresource       
+
+  ApiGatewayCloudWatchLogsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs'
+
+  ApiGatewayAccountConfig:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  # KMS Key for CloudWatch Logs
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for CloudWatch Logs encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Application
+          Value: idmaresource             
+
+  # API Gateway Resources
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${BaseStackName}-api-${Environment}'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+      Tags:
+        - Key: Application
+          Value: idmaresource       
+
+  ApiGateway:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub 'idma-api-${AWS::AccountId}-${RandomPrefix}'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: !Ref ApiStage
+      Description: Usage plan for API
+      UsagePlanName: !Sub '${BaseStackName}-usage-plan-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  EmptyValidator:
+    Type: 'AWS::ApiGateway::RequestValidator'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ValidateRequestBody: false
+      ValidateRequestParameters: false
+
+  # Knowledge Base and OpenSearch Index Configuration
+  OpenSearchIndexFunction:
+      Type: AWS::Lambda::Function
+      DependsOn: S3VPCEndpoint
+      Properties:
+        FunctionName: !Sub 'opensearch-index-function-${Environment}-${AWS::AccountId}-${RandomPrefix}'
+        Runtime: python3.9
+        Handler: index.lambda_handler
+        Role: !GetAtt OpenSearchIndexFunctionRole.Arn
+        Tags:
+          - Key: Application
+            Value: idmaresource         
+        Code:
+          ZipFile: |
+            import json
+            import boto3
+            import cfnresponse
+            from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+            import time
+            import urllib3
+            from botocore.config import Config
+
+            # Increase timeout for urllib3
+            urllib3.Timeout._DEFAULT_TIMEOUT = 60
+
+            def send_response_with_retry(event, context, response_status, reason=None, response_data=None, physical_resource_id=None):
+                try:
+                    cfnresponse.send(event, context, response_status, response_data or {}, physical_resource_id)
+                    return True
+                except Exception as e:
+                    print(f"Error sending response: {str(e)}")
+                    return False
+
+            def lambda_handler(event, context):
+                try:
+                    print("Event:", event)
+                    
+                    # For Delete operations, send success immediately
+                    if event['RequestType'] == 'Delete':
+                        # Try 3 times to send success response
+                        for i in range(3):
+                            if send_response_with_retry(event, context, cfnresponse.SUCCESS):
+                                return
+                            time.sleep(1)
+                        return  # Continue with deletion even if we can't confirm
+
+                    if event['RequestType'] in ['Create', 'Update']:
+                        region = event['ResourceProperties']['Region']
+                        collection_endpoint = event['ResourceProperties']['CollectionEndpoint']
+                        index_name = event['ResourceProperties']['IndexName']
+                        
+                        # Configure boto3 with higher timeouts
+                        config = Config(
+                            connect_timeout=60,
+                            read_timeout=60,
+                            retries={'max_attempts': 3}
+                        )
+                        session = boto3.Session()
+                        credentials = session.get_credentials()
+                        
+                        auth = AWSV4SignerAuth(credentials, region, 'aoss')
+                        host = collection_endpoint.replace("https://", "")
+                        
+                        client = OpenSearch(
+                            hosts=[{'host': host, 'port': 443}],
+                            http_auth=auth,
+                            use_ssl=True,
+                            verify_certs=True,
+                            connection_class=RequestsHttpConnection,
+                            timeout=60,
+                            max_retries=3,
+                            retry_on_timeout=True
+                        )
+                        
+                        index_body = {
+                            "settings": {"index": {"knn": True}},
+                            "mappings": {
+                                "properties": {
+                                    "vector_field": {
+                                        "type": "knn_vector",
+                                        "dimension": 512,
+                                        "method": {
+                                            "name": "hnsw",
+                                            "engine": "faiss",
+                                            "parameters": {"ef_construction": 128, "m": 24}
+                                        }
+                                    },
+                                    "AMAZON_BEDROCK_METADATA": {"type": "text", "index": False},
+                                    "AMAZON_BEDROCK_TEXT_CHUNK": {"type": "text", "index": True}
+                                }
+                            }
+                        }
+                        
+                        response = client.indices.create(index=index_name, body=index_body, ignore=400)
+                        print("OpenSearch create index response:", response)
+                        print(f"Waiting for index {index_name} to be ready...")
+                        time.sleep(30) 
+                        # Send success response with retry
+                        for i in range(3):
+                            if send_response_with_retry(event, context, cfnresponse.SUCCESS, 
+                                                      response_data={'IndexName': index_name}):
+                                return
+                            time.sleep(1)
+                        
+                except Exception as e:
+                    print(f"Error: {str(e)}")
+                    # Try to send failure response with retry
+                    for i in range(3):
+                        if send_response_with_retry(event, context, cfnresponse.FAILED, 
+                                                  reason=str(e)):
+                            return
+                        time.sleep(1)
+        Timeout: 60
+        MemorySize: 512
+        ReservedConcurrentExecutions: 5
+        VpcConfig:
+          SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds:
+            - !Ref LambdaSubnet1
+            - !Ref LambdaSubnet2
+        Layers:
+          - !Ref VectorLambdaLayer
+             
+
+
+  OpenSearchIndexFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+        - PolicyName: CloudFormationCustomResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - "arn:aws:s3:::cloudformation-custom-resource-response-*/*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+
+
+  # API Gateway Methods and Resources
+  RootPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction1.Arn}/invocations
+        TimeoutInMillis: 120000
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  RootOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: MOCK
+        TimeoutInMillis: 29000
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AnalyticsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'analytics'
+
+  AnalyticsPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref AnalyticsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction3.Arn}/invocations
+        TimeoutInMillis: 120000
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AnalyticsOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref AnalyticsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: MOCK
+        TimeoutInMillis: 120000
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Bot Endpoint
+  BotResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'bot'
+
+  BotPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref BotResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction1.Arn}/invocations
+        TimeoutInMillis: 120000
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  BotOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref BotResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: MOCK
+        TimeoutInMillis: 120000
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Database Migration Endpoint
+  DatabaseMigrationResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'database-migration'
+
+  DatabaseMigrationPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref DatabaseMigrationResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction2.Arn}/invocations
+        TimeoutInMillis: 120000
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DatabaseMigrationOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref DatabaseMigrationResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: MOCK
+        TimeoutInMillis: 120000
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Modern Strategy Endpoint
+  ModernStrategyResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'modern-strategy'
+
+  ModernStrategyPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ModernStrategyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction4.Arn}/invocations
+        TimeoutInMillis: 120000
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ModernStrategyOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ModernStrategyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EmptyValidator
+      Integration:
+        Type: MOCK
+        TimeoutInMillis: 120000
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Updated API Deployment with all dependencies
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - RootPostMethod
+      - RootOptionsMethod
+      - AnalyticsPostMethod
+      - AnalyticsOptionsMethod
+      - BotPostMethod
+      - BotOptionsMethod
+      - DatabaseMigrationPostMethod
+      - DatabaseMigrationOptionsMethod
+      - ModernStrategyPostMethod
+      - ModernStrategyOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: 'AWS::ApiGateway::Stage'
+    DependsOn: ApiGatewayAccountConfig
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "caller":"$context.identity.caller", "user":"$context.identity.user", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod", "resourcePath":"$context.resourcePath", "status":"$context.status", "protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
+
+  # Lambda Permissions
+  LambdaPermission1:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt LambdaFunction1.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/*'
+
+  LambdaPermission2:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt LambdaFunction2.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/*'
+
+  LambdaPermission3:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt LambdaFunction3.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/*'
+
+  LambdaPermission4:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt LambdaFunction4.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/*'
+
+  OpenSearchIndexFunctionPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt OpenSearchIndexFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: cloudformation.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+
+  OpenSearchIndex:
+    Type: Custom::OpenSearchIndex
+    DependsOn: 
+      - OpenSearchCollection
+      - OpenSearchIndexFunction
+    Properties:
+      ServiceToken: !GetAtt OpenSearchIndexFunction.Arn
+      Region: !Ref 'AWS::Region'
+      CollectionEndpoint: !GetAtt OpenSearchCollection.CollectionEndpoint
+      IndexName: !Ref Indexname
+
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway Endpoint'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+
+  AmplifyAppId:
+    Description: 'Amplify App ID'
+    Value: !GetAtt AmplifyApp.AppId
+
+  AmplifyDomain:
+    Description: 'Amplify App Domain'
+    Value: !Sub 'https://main.${AmplifyApp.DefaultDomain}'
+
+  ApiGatewayId:
+    Description: 'API Gateway ID'
+    Value: !Ref ApiGateway
+    
+  LambdaFunction1Arn:
+    Description: 'Bot Handler Lambda Function ARN'
+    Value: !GetAtt LambdaFunction1.Arn
+    
+  AmplifyBranchName:
+    Description: 'Amplify Branch Name'
+    Value: !GetAtt AmplifyBranch.BranchName
+
+  KnowledgeBaseBucketName:
+    Description: 'Knowledge Base S3 Bucket Name'
+    Value: !Ref KnowledgeBaseBucketName
+    
+  VpcId:
+    Description: 'VPC ID for Lambda functions'
+    Value: !Ref LambdaVPC
+    
+  SubnetId1:
+    Description: 'Subnet ID 1 for Lambda functions'
+    Value: !Ref LambdaSubnet1
+    
+  SubnetId2:
+    Description: 'Subnet ID 2 for Lambda functions'
+    Value: !Ref LambdaSubnet2
+    
+  SecurityGroupId:
+    Description: 'Security Group ID for Lambda functions'
+    Value: !Ref LambdaSecurityGroup
+
+  KnowledgeBaseId:
+    Description: 'KnowledgeBase ID of the Bedrock Knowledge Base'
+    Value: !Ref KnowledgeBaseWithAoss
+  
+  DataSourceId:
+    Description: 'DataSource ID of the Bedrock Knowledge Base'
+    Value: !GetAtt SampleDataSource.DataSourceId
+
+  BasicAuthUsername:
+    Description: 'Username for frontend basic authentication'
+    Value: !Ref BasicAuthUsername
+
+  BasicAuthSecretArn:
+    Description: 'Secrets Manager secret holding the frontend basic auth credentials'
+    Value: !Ref AmplifyBasicAuthSecret
