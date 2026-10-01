@@ -201,7 +201,7 @@ This Guidance offers a **one-click deployment** feature, leveraging AWS CloudFor
 ### 1. Clone the Repository
 
 ```bash 
-git clone git@ssh.code.aws.dev:personal_projects/alias_j/jitenkmr/guidance-for-intelligent-data-modernization-assistant-on-aws.git
+git clone git@github.com:aws-solutions-library-samples/guidance-for-intelligent-data-modernization-assistant-on-aws.git
 ```
 
 ### 2. Set Up Python Virtual Environment
@@ -594,3 +594,4 @@ Customers are responsible for making their own independent assessment of the inf
 * [Jitendra Kumar](https://www.linkedin.com/in/jitendrkumar/)
 * [HariKrishna Boorgadda](https://www.linkedin.com/in/hari-krishna-569b8445/)
 * [Vikas Gupta](https://www.linkedin.com/in/vikasg/)
+* [Ashish Srivastava](https://www.linkedin.com/in/ashishdba/)

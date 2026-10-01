@@ -1,7 +1,5 @@
 # Configuration settings
 
-bucket_name = "genai-migstrategy-01"
-kb_bucket_name ="idma-gcc-kb"
 region_name = 'us-east-1'
 vector_store_name="idma-os-vector-store"
 index_name="idma-vector-index"
@@ -229,6 +227,3 @@ prompts = {
     "runbook_generator": "Generate AWS Migration runbook and ensure you follow AS well architected framework principals while generating runbook. Infrastrcture code refer user to use IAC generator tab to get the relevant code.Be precise and dont hallucinate and dont give vague response",
     "wave_planning": "Generate a wave plan and effort estimation for the migration."
 }
-
-
-knowledge_base_id = 'R41V41ZRJW'
