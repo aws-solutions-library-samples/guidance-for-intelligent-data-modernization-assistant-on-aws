@@ -2,6 +2,12 @@
 .DS_Store
 **/.DS_Store
 
+# Windows
+Thumbs.db
+**/Thumbs.db
+desktop.ini
+**/desktop.ini
+
 # Python
 __pycache__/
 *.py[cod]
@@ -41,6 +47,8 @@ temp_lambda/
 *.zip
 
 # Environment files
+.env
+**/.env
 .env.local
 .env.*.local
 
